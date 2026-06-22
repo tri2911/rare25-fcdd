@@ -1,12 +1,11 @@
 """
 CaFormer-S18 backbone with SurgeNet / GastroNet weight loading.
 
-Wraps timm's caformer_s18 and exposes:
-  - forward_spatial(x) → [B, 512, 7, 7]   (for FCDD spatial loss)
-  - forward(x)         → [B, 512]          (global average pooled)
-
-Weight loading handles the common key-prefix variants found in teacher
-checkpoints from knowledge-distillation pipelines.
+Weight-loading strategy (tried in order):
+  1. Direct key match
+  2. Strip common prefixes (backbone., model., teacher., ...)
+  3. Remap original MetaFormer repo keys → timm key names
+  4. Fallback: timm ImageNet-22k pretrained caformer_s18
 """
 
 import torch
@@ -17,7 +16,6 @@ import timm
 class CaFormerBackbone(nn.Module):
     def __init__(self):
         super().__init__()
-        # num_classes=0, global_pool='' → forward_features returns spatial tokens
         self._model = timm.create_model(
             'caformer_s18',
             pretrained=False,
@@ -28,27 +26,72 @@ class CaFormerBackbone(nn.Module):
 
     def forward_spatial(self, x: torch.Tensor) -> torch.Tensor:
         """Return [B, 512, H, W] spatial feature map (H=W=7 for 224px input)."""
-        feats = self._model.forward_features(x)   # [B, H, W, C] or [B, C, H, W]
-        if feats.shape[1] != self.feature_dim:
-            # timm returns [B, H, W, C] for some MetaFormer variants — permute
+        feats = self._model.forward_features(x)
+        if feats.ndim == 4 and feats.shape[1] != self.feature_dim:
             feats = feats.permute(0, 3, 1, 2).contiguous()
         return feats
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return [B, 512] globally pooled features."""
-        feats = self.forward_spatial(x)           # [B, C, H, W]
-        return feats.mean(dim=[2, 3])             # [B, C]
+        return self.forward_spatial(x).mean(dim=[2, 3])
 
 
-def _strip_prefix(state_dict: dict, prefix: str) -> dict:
-    return {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
+# ── Key-name utilities ────────────────────────────────────────────────────────
 
+def _strip_prefix(sd: dict, prefix: str) -> dict:
+    return {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
+
+
+def _remap_metaformer_to_timm(sd: dict) -> dict:
+    """
+    Map original MetaFormer repo key names → timm caformer_s18 key names.
+
+    Original repo layout:
+      downsample_layers.0.*     stem patch-embedding
+      downsample_layers.N.*     inter-stage downsampling (N=1,2,3)
+      network.N.K.*             stage N, block K
+      norm_pred.*               final norm
+
+    timm layout:
+      stem.*
+      stages.N.downsample.*     (N = original_N - 1)
+      stages.N.blocks.K.*
+      norm.*
+    """
+    new_sd = {}
+    for k, v in sd.items():
+        # Stem
+        if k.startswith('downsample_layers.0.'):
+            nk = k.replace('downsample_layers.0.', 'stem.').replace('post_norm', 'norm')
+        # Inter-stage downsampling
+        elif k.startswith('downsample_layers.'):
+            parts = k.split('.', 2)
+            n    = int(parts[1])
+            rest = (parts[2] if len(parts) > 2 else '').replace('pre_norm', 'norm')
+            nk   = f'stages.{n - 1}.downsample.{rest}'
+        # Blocks
+        elif k.startswith('network.'):
+            parts = k.split('.', 3)
+            n, b  = parts[1], parts[2]
+            rest  = parts[3] if len(parts) > 3 else ''
+            nk    = f'stages.{n}.blocks.{b}.{rest}' if rest else f'stages.{n}.blocks.{b}'
+        # Final norm
+        elif k.startswith('norm_pred.'):
+            nk = k.replace('norm_pred.', 'norm.')
+        else:
+            nk = k
+        new_sd[nk] = v
+    return new_sd
+
+
+def _missing_non_head(result) -> int:
+    return len([k for k in result.missing_keys if 'head' not in k])
+
+
+# ── Weight loading ────────────────────────────────────────────────────────────
 
 def load_surgenet_weights(model: CaFormerBackbone, ckpt_path: str) -> None:
-    """Load SurgeNet teacher checkpoint into the backbone, tolerating key-prefix variants."""
     ckpt = torch.load(ckpt_path, map_location='cpu')
 
-    # Checkpoints can store state dict under different keys
     if isinstance(ckpt, dict):
         sd = (
             ckpt.get('state_dict')
@@ -60,36 +103,64 @@ def load_surgenet_weights(model: CaFormerBackbone, ckpt_path: str) -> None:
     else:
         sd = ckpt
 
-    # Try loading as-is first
+    # 1 — direct load
     result = model._model.load_state_dict(sd, strict=False)
-    if len(result.missing_keys) == 0:
+    if _missing_non_head(result) == 0:
         print('Loaded SurgeNet weights (exact match).')
         return
 
-    # Try common prefixes
-    for prefix in ('backbone.', 'model.', 'encoder.', 'module.', 'base_model.'):
+    # 2 — strip common prefixes
+    for prefix in ('backbone.', 'model.', 'encoder.', 'module.', 'base_model.', 'teacher.'):
         if any(k.startswith(prefix) for k in sd):
             stripped = _strip_prefix(sd, prefix)
             result = model._model.load_state_dict(stripped, strict=False)
-            if len(result.missing_keys) == 0:
+            if _missing_non_head(result) == 0:
                 print(f'Loaded SurgeNet weights (stripped prefix "{prefix}").')
                 return
-            # Partial load is still acceptable — backbone layers are what matter
-            print(
-                f'Partial load (prefix "{prefix}"): '
-                f'{len(result.missing_keys)} missing, '
-                f'{len(result.unexpected_keys)} unexpected.'
-            )
-            return
+            # try remapping the stripped dict too
+            remapped = _remap_metaformer_to_timm(stripped)
+            result = model._model.load_state_dict(remapped, strict=False)
+            if _missing_non_head(result) <= 3:
+                print(f'Loaded SurgeNet weights (prefix "{prefix}" + MetaFormer remap, '
+                      f'{_missing_non_head(result)} non-head keys missing).')
+                return
 
+    # 3 — MetaFormer original repo → timm remap
+    remapped = _remap_metaformer_to_timm(sd)
+    result = model._model.load_state_dict(remapped, strict=False)
+    if _missing_non_head(result) <= 3:
+        print(f'Loaded SurgeNet weights (MetaFormer→timm remap, '
+              f'{_missing_non_head(result)} non-head keys missing).')
+        return
+
+    # 4 — fallback: timm ImageNet-22k pretrained
     print(
-        f'Warning: could not cleanly match SurgeNet keys. '
-        f'Missing: {result.missing_keys[:5]}  Unexpected: {result.unexpected_keys[:5]}'
+        f'SurgeNet key mapping failed ({_missing_non_head(result)} non-head keys missing). '
+        'Falling back to timm ImageNet-22k pretrained caformer_s18 ...'
     )
+    pretrained = timm.create_model(
+        'caformer_s18.sail_in22k_ft_in1k',
+        pretrained=True,
+        num_classes=0,
+        global_pool='',
+    )
+    model._model.load_state_dict(pretrained.state_dict(), strict=True)
+    del pretrained
+    print('Loaded timm ImageNet pretrained caformer_s18 weights (fallback).')
 
 
 def build_backbone(local_backbone_path: str | None = None) -> CaFormerBackbone:
     backbone = CaFormerBackbone()
     if local_backbone_path:
         load_surgenet_weights(backbone, local_backbone_path)
+    else:
+        print('No backbone path provided — using timm ImageNet pretrained caformer_s18.')
+        pretrained = timm.create_model(
+            'caformer_s18.sail_in22k_ft_in1k',
+            pretrained=True,
+            num_classes=0,
+            global_pool='',
+        )
+        backbone._model.load_state_dict(pretrained.state_dict(), strict=True)
+        del pretrained
     return backbone
