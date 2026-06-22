@@ -24,25 +24,44 @@ IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp'}
 
 LABEL_MAP = {
     # folder-name → integer label
-    'normal': 0, 'healthy': 0, '0': 0,
-    'cancer': 1, 'lesion': 1, 'abnormal': 1, 'polyp': 1, '1': 1,
+    'normal': 0, 'healthy': 0, 'ndbe': 0, '0': 0,
+    'cancer': 1, 'lesion': 1, 'abnormal': 1, 'polyp': 1, 'neo': 1, '1': 1,
 }
 
 
 def _collect_from_class_dirs(raw_dir: str) -> list[dict]:
-    """Images live in raw_dir/<class_name>/*.jpg"""
+    """
+    Handles two layouts:
+      flat   : raw_dir/<class_name>/<images>
+      nested : raw_dir/<center_name>/<class_name>/<images>  (RARE25 format)
+    """
     records = []
-    for class_name in sorted(os.listdir(raw_dir)):
-        class_dir = os.path.join(raw_dir, class_name)
-        if not os.path.isdir(class_dir):
+
+    for entry in sorted(os.listdir(raw_dir)):
+        entry_path = os.path.join(raw_dir, entry)
+        if not os.path.isdir(entry_path):
             continue
-        label = LABEL_MAP.get(class_name.lower())
-        if label is None:
-            print(f'  [SKIP] Unknown class folder: {class_name!r}')
-            continue
-        for fpath in sorted(glob.glob(os.path.join(class_dir, '**', '*'), recursive=True)):
-            if os.path.splitext(fpath)[1].lower() in IMAGE_EXTS:
-                records.append({'filepath': fpath, 'label': label})
+
+        # Is this entry itself a class folder?
+        if entry.lower() in LABEL_MAP:
+            label = LABEL_MAP[entry.lower()]
+            for fpath in sorted(glob.glob(os.path.join(entry_path, '**', '*'), recursive=True)):
+                if os.path.splitext(fpath)[1].lower() in IMAGE_EXTS:
+                    records.append({'filepath': fpath, 'label': label})
+        else:
+            # Treat as a center/group folder — look one level deeper for class dirs
+            for class_name in sorted(os.listdir(entry_path)):
+                class_dir = os.path.join(entry_path, class_name)
+                if not os.path.isdir(class_dir):
+                    continue
+                label = LABEL_MAP.get(class_name.lower())
+                if label is None:
+                    print(f'  [SKIP] Unknown class folder: {entry}/{class_name!r}')
+                    continue
+                for fpath in sorted(glob.glob(os.path.join(class_dir, '**', '*'), recursive=True)):
+                    if os.path.splitext(fpath)[1].lower() in IMAGE_EXTS:
+                        records.append({'filepath': fpath, 'label': label})
+
     return records
 
 
