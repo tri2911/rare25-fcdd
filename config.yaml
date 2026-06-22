@@ -1,0 +1,26 @@
+model:
+  backbone: caformer_s18
+  local_backbone_path: '/content/drive/MyDrive/rare25-project/backbones/SurgeNet_teacher.pth'
+  feature_dim: 512
+  rep_dim: 256
+
+data:
+  raw_dir:    '/content/drive/MyDrive/rare25-project/data/raw'
+  splits_dir: '/content/drive/MyDrive/rare25-project/data/splits'
+  image_size: 224
+  val_frac: 0.15
+  test_frac: 0.15
+  seed: 42
+
+training:
+  epochs: 50
+  batch_size: 32
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  num_workers: 4
+  resume: null          # set to checkpoint path to resume training
+
+outputs:
+  checkpoint_dir: '/content/drive/MyDrive/rare25-project/outputs/checkpoints'
+  heatmap_dir:    '/content/drive/MyDrive/rare25-project/outputs/heatmaps'
+  report_dir:     '/content/drive/MyDrive/rare25-project/outputs/reports'

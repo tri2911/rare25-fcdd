@@ -1,0 +1,6 @@
+timm
+huggingface_hub
+scikit-learn
+matplotlib
+opencv-python
+pyyaml

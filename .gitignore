@@ -1,0 +1,6 @@
+data/
+outputs/
+backbones/
+*.pth
+__pycache__/
+.DS_Store
