@@ -18,6 +18,7 @@ training:
   lr: 1.0e-4
   weight_decay: 1.0e-4
   num_workers: 4
+  checkpoint_every: 5   # save a numbered checkpoint every N epochs
   resume: null          # set to checkpoint path to resume training
 
 outputs:

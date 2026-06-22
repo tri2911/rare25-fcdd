@@ -123,8 +123,13 @@ def main():
         print(f'Center norm: {center.norm().item():.4f}')
 
     # ── Training loop ────────────────────────────────────────────────────────
-    ckpt_dir = cfg['outputs']['checkpoint_dir']
-    epochs   = cfg['training']['epochs']
+    from src.evaluate import compute_auroc
+
+    ckpt_dir      = cfg['outputs']['checkpoint_dir']
+    epochs        = cfg['training']['epochs']
+    ckpt_interval = cfg['training'].get('checkpoint_every', 5)
+    best_auroc    = 0.0
+    best_path     = os.path.join(ckpt_dir, 'best_model.pth')
 
     for epoch in range(start_epoch, epochs + 1):
         model.train()
@@ -139,28 +144,39 @@ def main():
             optimizer.step()
             total_loss += loss.item()
 
-        avg_loss = total_loss / len(train_loader)
-
-        # ── Validation AUROC ─────────────────────────────────────────────────
-        from src.evaluate import compute_auroc
+        avg_loss  = total_loss / len(train_loader)
         val_auroc = compute_auroc(model, val_loader, center, device)
+
+        is_best = val_auroc > best_auroc
+        if is_best:
+            best_auroc = val_auroc
 
         print(
             f'Epoch {epoch:3d}/{epochs} | '
             f'loss {avg_loss:.4f} | val AUROC {val_auroc:.4f}'
+            + (' ← best' if is_best else '')
         )
 
-        # Save checkpoint every epoch
-        ckpt_path = os.path.join(ckpt_dir, f'epoch_{epoch:04d}.pth')
-        save_checkpoint({
+        state = {
             'epoch': epoch,
             'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'center': center.cpu(),
             'val_auroc': val_auroc,
-        }, ckpt_path)
+        }
 
-    print('Training complete.')
+        # Periodic checkpoint every N epochs
+        if epoch % ckpt_interval == 0 or epoch == epochs:
+            ckpt_path = os.path.join(ckpt_dir, f'epoch_{epoch:04d}.pth')
+            save_checkpoint(state, ckpt_path)
+            print(f'  Checkpoint saved → {ckpt_path}')
+
+        # Always overwrite best_model.pth when AUROC improves
+        if is_best:
+            save_checkpoint(state, best_path)
+            print(f'  Best model saved → {best_path}  (AUROC {best_auroc:.4f})')
+
+    print(f'\nTraining complete. Best val AUROC: {best_auroc:.4f}')
 
 
 if __name__ == '__main__':
