@@ -17,10 +17,20 @@ import csv
 from collections import Counter
 
 import pandas as pd
+from PIL import Image
 from sklearn.model_selection import train_test_split
 
 
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp'}
+
+
+def _is_valid_image(path: str) -> bool:
+    try:
+        with Image.open(path) as img:
+            img.verify()
+        return True
+    except Exception:
+        return False
 
 LABEL_MAP = {
     # folder-name → integer label
@@ -34,22 +44,30 @@ def _collect_from_class_dirs(raw_dir: str) -> list[dict]:
     Handles two layouts:
       flat   : raw_dir/<class_name>/<images>
       nested : raw_dir/<center_name>/<class_name>/<images>  (RARE25 format)
+    Skips unreadable / corrupted image files.
     """
     records = []
+    skipped = 0
+
+    def _add(fpath: str, label: int) -> None:
+        nonlocal skipped
+        if not _is_valid_image(fpath):
+            print(f'  [CORRUPT] {fpath}')
+            skipped += 1
+            return
+        records.append({'filepath': fpath, 'label': label})
 
     for entry in sorted(os.listdir(raw_dir)):
         entry_path = os.path.join(raw_dir, entry)
         if not os.path.isdir(entry_path):
             continue
 
-        # Is this entry itself a class folder?
         if entry.lower() in LABEL_MAP:
             label = LABEL_MAP[entry.lower()]
             for fpath in sorted(glob.glob(os.path.join(entry_path, '**', '*'), recursive=True)):
                 if os.path.splitext(fpath)[1].lower() in IMAGE_EXTS:
-                    records.append({'filepath': fpath, 'label': label})
+                    _add(fpath, label)
         else:
-            # Treat as a center/group folder — look one level deeper for class dirs
             for class_name in sorted(os.listdir(entry_path)):
                 class_dir = os.path.join(entry_path, class_name)
                 if not os.path.isdir(class_dir):
@@ -60,8 +78,10 @@ def _collect_from_class_dirs(raw_dir: str) -> list[dict]:
                     continue
                 for fpath in sorted(glob.glob(os.path.join(class_dir, '**', '*'), recursive=True)):
                     if os.path.splitext(fpath)[1].lower() in IMAGE_EXTS:
-                        records.append({'filepath': fpath, 'label': label})
+                        _add(fpath, label)
 
+    if skipped:
+        print(f'  Skipped {skipped} corrupted files.')
     return records
 
 

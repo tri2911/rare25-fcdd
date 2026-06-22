@@ -40,7 +40,11 @@ class RARE25Dataset(Dataset):
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
         row = self.df.iloc[idx]
-        img = Image.open(row['filepath']).convert('RGB')
+        try:
+            img = Image.open(row['filepath']).convert('RGB')
+        except Exception:
+            # Return a black image so one bad file doesn't kill the whole run
+            img = Image.new('RGB', (224, 224), 0)
         return self.transform(img), int(row['label'])
 
     @property
