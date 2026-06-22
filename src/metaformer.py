@@ -63,11 +63,12 @@ def _remap_metaformer_to_timm(sd: dict) -> dict:
         if k.startswith('downsample_layers.0.'):
             nk = k.replace('downsample_layers.0.', 'stem.').replace('post_norm', 'norm')
         # Inter-stage downsampling
+        # downsample_layers.N (N=1,2,3) lives at the START of stage N in timm → stages.N
         elif k.startswith('downsample_layers.'):
             parts = k.split('.', 2)
             n    = int(parts[1])
             rest = (parts[2] if len(parts) > 2 else '').replace('pre_norm', 'norm')
-            nk   = f'stages.{n - 1}.downsample.{rest}'
+            nk   = f'stages.{n}.downsample.{rest}'
         # Blocks
         elif k.startswith('network.'):
             parts = k.split('.', 3)
@@ -89,6 +90,32 @@ def _missing_non_head(result) -> int:
 
 # ── Weight loading ────────────────────────────────────────────────────────────
 
+def _try_load(model_part: nn.Module, sd: dict, label: str) -> bool:
+    """Attempt load; return True on success, False on any error."""
+    try:
+        result = model_part.load_state_dict(sd, strict=False)
+        if _missing_non_head(result) <= 3:
+            print(f'Loaded SurgeNet weights ({label}, '
+                  f'{_missing_non_head(result)} non-head keys missing).')
+            return True
+    except RuntimeError:
+        pass
+    return False
+
+
+def _load_imagenet_fallback(model: CaFormerBackbone) -> None:
+    print('Falling back to timm ImageNet-22k pretrained caformer_s18 ...')
+    pretrained = timm.create_model(
+        'caformer_s18.sail_in22k_ft_in1k',
+        pretrained=True,
+        num_classes=0,
+        global_pool='',
+    )
+    model._model.load_state_dict(pretrained.state_dict(), strict=True)
+    del pretrained
+    print('Loaded timm ImageNet pretrained caformer_s18 weights (fallback).')
+
+
 def load_surgenet_weights(model: CaFormerBackbone, ckpt_path: str) -> None:
     ckpt = torch.load(ckpt_path, map_location='cpu')
 
@@ -104,49 +131,27 @@ def load_surgenet_weights(model: CaFormerBackbone, ckpt_path: str) -> None:
         sd = ckpt
 
     # 1 — direct load
-    result = model._model.load_state_dict(sd, strict=False)
-    if _missing_non_head(result) == 0:
-        print('Loaded SurgeNet weights (exact match).')
+    if _try_load(model._model, sd, 'exact match'):
         return
 
-    # 2 — strip common prefixes
+    # 2 — strip common prefixes (with and without MetaFormer remap)
     for prefix in ('backbone.', 'model.', 'encoder.', 'module.', 'base_model.', 'teacher.'):
         if any(k.startswith(prefix) for k in sd):
             stripped = _strip_prefix(sd, prefix)
-            result = model._model.load_state_dict(stripped, strict=False)
-            if _missing_non_head(result) == 0:
-                print(f'Loaded SurgeNet weights (stripped prefix "{prefix}").')
+            if _try_load(model._model, stripped, f'prefix="{prefix}"'):
                 return
-            # try remapping the stripped dict too
             remapped = _remap_metaformer_to_timm(stripped)
-            result = model._model.load_state_dict(remapped, strict=False)
-            if _missing_non_head(result) <= 3:
-                print(f'Loaded SurgeNet weights (prefix "{prefix}" + MetaFormer remap, '
-                      f'{_missing_non_head(result)} non-head keys missing).')
+            if _try_load(model._model, remapped, f'prefix="{prefix}" + MetaFormer remap'):
                 return
 
-    # 3 — MetaFormer original repo → timm remap
+    # 3 — MetaFormer original repo → timm remap on raw sd
     remapped = _remap_metaformer_to_timm(sd)
-    result = model._model.load_state_dict(remapped, strict=False)
-    if _missing_non_head(result) <= 3:
-        print(f'Loaded SurgeNet weights (MetaFormer→timm remap, '
-              f'{_missing_non_head(result)} non-head keys missing).')
+    if _try_load(model._model, remapped, 'MetaFormer→timm remap'):
         return
 
     # 4 — fallback: timm ImageNet-22k pretrained
-    print(
-        f'SurgeNet key mapping failed ({_missing_non_head(result)} non-head keys missing). '
-        'Falling back to timm ImageNet-22k pretrained caformer_s18 ...'
-    )
-    pretrained = timm.create_model(
-        'caformer_s18.sail_in22k_ft_in1k',
-        pretrained=True,
-        num_classes=0,
-        global_pool='',
-    )
-    model._model.load_state_dict(pretrained.state_dict(), strict=True)
-    del pretrained
-    print('Loaded timm ImageNet pretrained caformer_s18 weights (fallback).')
+    print('SurgeNet key mapping exhausted all strategies.')
+    _load_imagenet_fallback(model)
 
 
 def build_backbone(local_backbone_path: str | None = None) -> CaFormerBackbone:
